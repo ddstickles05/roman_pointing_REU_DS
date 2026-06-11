@@ -210,7 +210,7 @@ def get_science_target_diameter(sci_name, sci_coord, band):
         print(f"  Science target diameter: {val:.4f} mas  [{src}]")
         return val, src
 
-    except Exception as exc:
+    except (requests.RequestException, KeyError, ValueError) as exc:
         print(f"  Warning: VizieR query failed for '{sci_name}': {exc} — diameter unavailable.")
         return None, None
 
@@ -397,20 +397,20 @@ def load_catalog(
     resolved_cache = Path(cache_path) if cache_path else DEFAULT_CACHE_PATH
 
     if not force_refresh and cache_is_fresh(resolved_cache, max_cache_age_hours):
-        print(f"Loading catalog from cache ({resolved_cache.name})...")
+        print(f"Loading CORGIDB reference star catalog from cache ({resolved_cache.name})...")
         df = pd.read_csv(resolved_cache, low_memory=False)
-        print(f"Catalog loaded: {len(df)} reference star(s).")
+        print(f"  CORGIDB catalog loaded: {len(df)} reference star(s).")
         return df
 
     fetch_error = None
-    print(f"Fetching catalog from {url} ...")
+    print(f"Fetching CORGIDB reference star catalog from {url} ...")
     try:
         df = fetch_catalog(url)
         df = coerce_catalog(df)
         resolved_cache.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(resolved_cache, index=False)
-        print(f"  Catalog cached → {resolved_cache}")
-        print(f"Catalog loaded: {len(df)} reference star(s).")
+        print(f"  CORGIDB catalog cached → {resolved_cache}")
+        print(f"  CORGIDB catalog loaded: {len(df)} reference star(s).")
         return df
     except Exception as exc:
         fetch_error = exc
@@ -423,7 +423,7 @@ def load_catalog(
             stacklevel=2,
         )
         df = pd.read_csv(resolved_cache, low_memory=False)
-        print(f"Catalog loaded from stale cache: {len(df)} reference star(s).")
+        print(f"  CORGIDB catalog loaded from stale cache: {len(df)} reference star(s).")
         return df
 
     raise RuntimeError(
@@ -431,42 +431,23 @@ def load_catalog(
         f"and no cache exists at {resolved_cache}."
     )
 
-def get_science_mag(sci_name, band, catalog=None, engine=None):
-    """Look up the science target magnitude from the catalog or corgidb star endpoint.
+def get_science_mag(sci_name, band, engine=None):
+    """Look up the science target magnitude from the corgidb individual-star endpoint.
+
     Args:
-        sci_name (str): SIMBAD-resolvable science target name, e.g. '47 Uma'.
+        sci_name (str): Science target name, e.g. '47 Uma'.
         band (int or str): Photometric band — 1 (V-band NFB), '1w' (V-band
             Wide FOV), 3 (I-band Spec), or 4 (I-band Wide FOV).
-        catalog (pandas.DataFrame, optional): Loaded reference star catalog
-            from load_catalog(). If None, the catalog lookup is skipped and
-            fetch_star.php is queried directly.
         engine: Ignored. Kept for backwards compatibility.
 
     Returns:
         float or None: Magnitude value in the appropriate band, or None if
-            not found in either the catalog or the star endpoint.
+            not found.
     """
     mag_col = "sy_vmag" if band in (1, "1w") else "sy_imag"
     band_label = BAND_LABEL.get(band, "?")
 
-    # 1) Try the ref catalog first (works if science target is also a ref star)
-    if catalog is not None:
-        sci_norm = sci_name.strip().lower().lstrip("* ")
-        mask = (
-            catalog["main_id"].astype(str).str.strip().str.lstrip("* ").str.lower() == sci_norm
-        ) | (
-            catalog["st_name"].astype(str).str.strip().str.lstrip("* ").str.lower() == sci_norm
-        )
-        match = catalog[mask]
-        if not match.empty:
-            val = safe_float(match.iloc[0].get(mag_col))
-            if val is not None:
-                print(f"  Science target {band_label}-band mag: {val:.2f} (from catalog)")
-                return val
-
-    # 2) Fall back to fetch_star.php (the individual-star endpoint)
     try:
-        import requests, numpy as np, pandas as pd
         url = "https://corgidb.sioslab.com/fetch_star.php"
         resp = requests.get(
             url,
@@ -540,7 +521,6 @@ def build_skycoord(star):
         kwargs["radial_velocity"] = get_field("st_radv") * u.km / u.s
 
     return c.SkyCoord(**kwargs).transform_to(c.BarycentricMeanEcliptic)
-
 
 
 def get_observable_windows(times, keepout_array):
@@ -750,17 +730,16 @@ def select_ref_star(
     candidates = candidates.dropna(subset=[mag_col])
     candidates["grade_rank"] = candidates["grade"].map(grade_rank_map).fillna(99).astype(int)
 
-    print(f"  Grade filter {active_grades}: {len(candidates)} candidate(s) remaining.")
+    print(f"  Grade filter {active_grades}: {len(candidates)} candidate(s) remaining (sourced from CORGIDB database).")
 
-    print(f"Querying SIMBAD for '{sci_name}'...")
+    print(f"Looking up coordinates for '{sci_name}' via CORGIDB StarAliases (SIMBAD fallback if not found)...")
     coords = get_target_coords([sci_name])
     if sci_name not in coords:
-        return {"error": f"Science target '{sci_name}' not found in SIMBAD."}
+        return {"error": f"Science target '{sci_name}' not found in CORGIDB or SIMBAD."}
     sci_coord = coords[sci_name]
-    print(f"  Found '{sci_name}'.")
 
     print(f"Looking up {band_label}-band magnitude for '{sci_name}'...")
-    sci_mag = get_science_mag(sci_name, band, catalog=catalog)
+    sci_mag = get_science_mag(sci_name, band)
 
     print(f"Looking up diameter for '{sci_name}' from VizieR JSDC v2...")
     sci_diameter, sci_diameter_src = get_science_target_diameter(sci_name, sci_coord, band)
@@ -808,7 +787,7 @@ def select_ref_star(
     )
     sci_pitch_vals = sci_pitch_full.to(u.degree).value
 
-    print("Building reference star coordinates...")
+    print("Building reference star coordinates from CORGIDB catalog...")
     ref_coords = {}
     for _, ref in candidates.iterrows():
         name = ref["main_id"]

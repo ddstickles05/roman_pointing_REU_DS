@@ -8,6 +8,7 @@ import matplotlib
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
+import requests
 from astropy.coordinates import BarycentricMeanEcliptic, Distance, SkyCoord
 from astropy.time import Time
 from astroquery.simbad import Simbad
@@ -20,29 +21,47 @@ from roman_pointing.roman_pointing import (
 
 
 def get_target_coords(target_names):
-    """Query SIMBAD for astronomical target coordinates and proper motions.
+    """Resolve target names to BarycentricMeanEcliptic SkyCoords.
 
-    Retrieves celestial coordinates, parallax, proper motion, and radial velocity
-    data from SIMBAD database for specified astronomical objects. Transforms
-    coordinates to Barycentric Mean Ecliptic frame for Roman Space Telescope
-    pointing calculations.
+    Retrieves celestial coordinates, proper motion, parallax, and radial
+    velocity for each target and transforms them to the Barycentric Mean
+    Ecliptic frame for Roman Space Telescope pointing calculations.
+
+    Resolution order for each target:
+        1. CORGIDB fetch_star.php endpoint (StarAliases table lookup).
+        2. SIMBAD (fallback if not found in CORGIDB).
+        3. Hardcoded galactic bulge coordinates (for names containing 'bulge').
 
     Args:
-        target_names (list of str): List of astronomical object names recognizable
-            by SIMBAD (e.g., 'Proxima Cen', 'Sirius', 'Betelgeuse'). Target names
-            containing 'bulge' will use hardcoded galactic
-            bulge coordinates.
+        target_names (list of str): Target names or registered CORGIDB/SIMBAD
+            aliases (e.g. '47 UMa', 'eps Eri'). Names containing 'bulge'
+            use hardcoded galactic bulge coordinates.
 
     Returns:
-        dict: Dictionary mapping target names (str) to astropy SkyCoord objects in
-            BarycentricMeanEcliptic frame. Targets not found in SIMBAD are
-            excluded from the returned dictionary.
+        dict: Dictionary mapping target name (str) to astropy SkyCoord in
+            BarycentricMeanEcliptic frame. Targets not resolved by either
+            CORGIDB or SIMBAD are omitted from the returned dictionary.
 
     Note:
-        This function prints a message to stdout when a target cannot be found
-        in SIMBAD. Special handling exists for galactic bulge targets. Any missing
-        proper motion/radial velocity data will be set to 0
+        Prints a message to stdout for each target indicating whether it was
+        found in CORGIDB, fell back to SIMBAD, or could not be resolved.
+        Missing proper motion and radial velocity values are set to zero.
+        The only component not queried from CORGIDB is science target angular
+        diameter, found in VizieR JSDC v2.
     """
+    _CORGI_COLS = [
+        "st_name", "main_id", "ra", "dec", "spectype",
+        "sy_vmag", "sy_imag", "sy_dist", "sy_plx",
+        "sy_pmra", "sy_pmdec", "st_radv",
+    ]
+
+    def _try_float(val):
+        try:
+            v = float(val)
+            return None if np.isnan(v) else v
+        except (TypeError, ValueError):
+            return None
+
     simbad = Simbad()
     simbad.add_votable_fields("pmra", "pmdec", "plx_value", "rvz_radvel")
     coords = {}
@@ -63,6 +82,56 @@ def get_target_coords(target_names):
             ).transform_to(BarycentricMeanEcliptic)
             continue
 
+        # Try CORGIDB StarAliases table first
+        try:
+            resp = requests.get(
+                "https://corgidb.sioslab.com/fetch_star.php",
+                headers={"User-Agent": "RomanRefStarPicker/1.0"},
+                params={"st_name": name},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+            if raw:
+                data = np.vstack(raw).transpose()
+                row = {
+                    col: data[i][0]
+                    for i, col in enumerate(_CORGI_COLS)
+                    if i < len(data)
+                }
+                ra = _try_float(row.get("ra"))
+                dec = _try_float(row.get("dec"))
+                if ra is not None and dec is not None:
+                    print(f"  Found '{name}' in CORGIDB (StarAliases lookup).")
+                    sc_kwargs = dict(
+                        ra=ra * u.degree,
+                        dec=dec * u.degree,
+                        frame="icrs",
+                        equinox="J2000",
+                        obstime="J2000",
+                    )
+                    plx = _try_float(row.get("sy_plx"))
+                    dist = _try_float(row.get("sy_dist"))
+                    if plx:
+                        sc_kwargs["distance"] = Distance(parallax=plx * u.mas)
+                    elif dist:
+                        sc_kwargs["distance"] = dist * u.pc
+                    pmra = _try_float(row.get("sy_pmra"))
+                    pmdec = _try_float(row.get("sy_pmdec"))
+                    radv = _try_float(row.get("st_radv"))
+                    if pmra:
+                        sc_kwargs["pm_ra_cosdec"] = pmra * u.mas / u.yr
+                    if pmdec:
+                        sc_kwargs["pm_dec"] = pmdec * u.mas / u.yr
+                    if radv:
+                        sc_kwargs["radial_velocity"] = radv * u.km / u.s
+                    coords[name] = SkyCoord(**sc_kwargs).transform_to(BarycentricMeanEcliptic)
+                    continue
+        except (requests.RequestException, ValueError, KeyError):
+            pass
+
+        # Fall back to SIMBAD
+        print(f"  '{name}' not found in CORGIDB — querying SIMBAD...")
         res = simbad.query_object(name)
         if len(res) == 0:
             print(f"SIMBAD could not find {name}. Skipping.")
@@ -893,7 +962,7 @@ HD 209458
                 print(f"Processing {len(target_names)} targets...")
 
                 coords = get_target_coords(target_names)
-                print(f" {len(coords)} found in SIMBAD")
+                print(f" {len(coords)} target(s) resolved (via CORGIDB/SIMBAD)")
 
                 if not coords:
                     print(" No valid targets found.")
@@ -955,7 +1024,7 @@ HD 209458
                 print(f"Processing {len(target_names)} targets...")
 
                 coords = get_target_coords(target_names)
-                print(f" {len(coords)} found in SIMBAD")
+                print(f" {len(coords)} target(s) resolved (via CORGIDB/SIMBAD)")
 
                 if not coords:
                     print(" No valid targets found.")
